@@ -246,3 +246,52 @@ var JP_DIGITS = {
   "零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
   "六": 6, "七": 7, "八": 8, "九": 9, "两": 2
 }
+
+// Parse an aria2c console summary line (streamed with --summary-interval=1)
+// into { downloaded, total, percent, dl, eta }, or null when the line is not
+// a progress line. Handles both bare labels ("12MiB/150MiB") and percent
+// labels ("70MiB/225MiB(31%)"), with padding and trailing "]".
+function parseAriaProgress(line) {
+  var s = String(line || "").trim()
+  var m = s.match(/^\[#[0-9a-f]+\s+(.*)$/)
+  if (!m) return null
+  var body = m[1]
+  var r = body.match(
+    /^([0-9.]+[KMGT]?i?B)\s*\/\s*([0-9.]+[KMGT]?i?B)(?:\s*\((\d+)%\))?\s+CN:\d+(?:\s+SD:\d+)?\s+DL:([^\s\]]+)(?:\s+UL:[^\s\]]+)?(?:\s+ETA:([^\]]+))?\]?\s*$/
+  )
+  if (!r) return null
+  return {
+    downloaded: String(r[1]),
+    total: String(r[2]),
+    percent: r[3] !== undefined ? parseInt(r[3], 10) : -1,
+    dl: String(r[4] || ""),
+    eta: String(r[5] || "")
+  }
+}
+
+// "12MiB" / "1.4GiB" / "850KB" -> bytes, or -1 when unparseable.
+function parseSize(txt) {
+  var m = String(txt || "").match(/^([0-9.]+)\s*([KMGT]?)(?:i?B)?$/i)
+  if (!m) return -1
+  var n = parseFloat(m[1])
+  var unit = String(m[2] || "").toUpperCase()
+  var mult = { "": 1, "K": 1024, "M": 1048576, "G": 1073741824, "T": 1099511627776 }
+  return isNaN(n) ? -1 : Math.round(n * (mult[unit] || 1))
+}
+
+// Format a byte count as a compact human string, or "" when it can't be
+// sized (e.g. metadata-only transfers still at 0B).
+function formatSize(txt) {
+  var n = parseSize(txt)
+  if (n < 0) return String(txt || "")
+  if (n < 1024) return n + " B"
+  var units = ["KB", "MB", "GB", "TB"]
+  var v = n
+  var i = -1
+  while (v >= 1024 && i < units.length - 1) {
+    v = v / 1024
+    i++
+  }
+  var s = (v >= 100 || Math.round(v) === v) ? String(Math.round(v)) : v.toFixed(1)
+  return s + " " + units[i]
+}

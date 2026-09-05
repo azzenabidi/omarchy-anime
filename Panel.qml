@@ -30,8 +30,13 @@ Panel {
   property var pickerEpisodes: []
   property string pickerNote: ""
   property string pickerSource: ""
-  property bool downloading: false
-  property string downloadStatus: ""
+
+  // Active / finished episode downloads. Rows use a ListModel so appending a
+  // new download never resets/deletes the running delegates (a plain JS array
+  // reassignment would destroy every row — and kill its aria2c process).
+  ListModel {
+    id: downloadsModel
+  }
 
   function startLookup(item) {
     if (lookupProc.running) return
@@ -42,8 +47,6 @@ Panel {
     root.pickerEpisodes = []
     root.pickerNote = ""
     root.pickerSource = ""
-    root.downloading = false
-    root.downloadStatus = ""
     lookupProc.command = [
       root.scriptPath,
       item.title || "",
@@ -56,21 +59,15 @@ Panel {
   function exitPicker() {
     root.inPicker = false
     root.pickerState = "hidden"
-    root.downloading = false
-    root.downloadStatus = ""
   }
 
   function startDownload(ep) {
     if (!ep || !ep.magnet) return
-    root.downloading = true
-    root.downloadStatus = "Starting download…"
-    Quickshell.execDetached([
-      root.scriptPath, "download",
-      ep.magnet, root.activeTitle, ep.n, root.downloadDir
-    ])
-    Qt.callLater(function() {
-      root.downloading = false
-      root.downloadStatus = "aria2c started — saving to " + root.downloadDir
+    downloadsModel.append({
+      magnet: ep.magnet,
+      show: root.activeTitle,
+      ep: String(ep.n || ""),
+      title: ep.title || ""
     })
   }
 
@@ -101,6 +98,37 @@ Panel {
         root.pickerNote = "Couldn't find episodes for this show"
       }
     }
+  }
+
+  // Re-adopt downloads that outlived a shell restart: ask the helper for the
+  // live manifest (aria2c still running) and re-create their rows, attaching
+  // each to its existing log so progress keeps streaming.
+  Process {
+    id: adoptProc
+    command: [root.scriptPath, "adopt"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var raw = String(text || "").trim()
+        if (!raw) return
+        var list = []
+        try { list = JSON.parse(raw) } catch (e) { list = [] }
+        if (!Array.isArray(list)) return
+        for (var i = 0; i < list.length; i++) {
+          var e = list[i]
+          if (!e) continue
+          downloadsModel.append({
+            magnet: e.magnet || "",
+            show: e.show || "",
+            ep: String(e.ep || ""),
+            title: e.title || "",
+            adoptLog: e.log || "",
+            adoptDir: e.dir || ""
+          })
+        }
+      }
+    }
+    Component.onCompleted: running = true
   }
 
   // Currently airing season data. Kept stale across failures so the popup
@@ -665,15 +693,275 @@ Panel {
             }
           }
 
-          Text {
+          // ---- Active downloads (live progress) ----
+          Column {
+            id: downloadsRoot
             width: parent.width
-            visible: root.downloadStatus !== ""
-            horizontalAlignment: Text.AlignHCenter
-            text: root.downloadStatus
-            color: Color.accent
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-            font.bold: true
+            visible: downloadsModel.count > 0
+            spacing: Style.space(6)
+
+            PanelSectionHeader {
+              width: parent.width
+              text: "Downloads"
+              foreground: root.barForeground
+            }
+
+            Repeater {
+              model: downloadsModel
+
+              // One row per started download. Each row owns the aria2c
+              // Process for its episode and renders its live progress.
+              Item {
+                id: drow
+                width: downloadsRoot.width
+                height: dlCol.implicitHeight + Style.space(10)
+
+                // Live state fed by the aria2c log summaries.
+                property int progress: -1                       // -1 until known
+                property string dlBytes: ""
+                property string dlTotal: ""
+                property string dlSpeed: ""
+                property string dlEta: ""
+                property string dlState: "starting"   // starting|downloading|done|failed
+                property string logPath: ""           // detached aria2c log
+                property bool finished: false         // settled as done/failed
+
+                // Set only when this row was re-adopted after a restart:
+                // attach to the surviving transfer instead of starting a new
+                // aria2c. (Roles from the manifest, so no launcher runs.)
+                property string adoptLog: ""
+                property string adoptDir: ""
+
+                Rectangle {
+                  anchors.fill: parent
+                  color: drowMouse.hovered ? Style.hoverFill : "transparent"
+                  radius: Style.cornerRadius
+                  border.width: 1
+                  border.color: Qt.rgba(root.barForeground.r, root.barForeground.g, root.barForeground.b, 0.12)
+                }
+
+                Process {
+                  id: dlLauncher
+                  command: [
+                    root.scriptPath, "download",
+                    magnet, show, ep, root.downloadDir
+                  ]
+                  stdout: StdioCollector {
+                    waitForEnd: true
+                    onStreamFinished: {
+                      var raw = String(text || "").trim()
+                      var data = {}
+                      try { data = JSON.parse(raw) } catch (e) {}
+                      drow.logPath = data.log || ""
+                      if (drow.logPath) {
+                        dlLog.path = drow.logPath
+                        dlPollTimer.start()
+                      }
+                    }
+                  }
+                  onExited: function(exitCode, exitStatus) {
+                    if (exitCode !== 0) {
+                      drow.dlState = "failed"
+                      drow.finished = true
+                    }
+                  }
+                  Component.onCompleted: {
+                    if (adoptLog) {
+                      drow.logPath = adoptLog
+                      dlLog.path = adoptLog
+                      dlPollTimer.start()
+                    } else if (magnet) {
+                      running = true
+                    }
+                  }
+                }
+
+                // Reads the detached aria2c log. On each write (inotify) we reload and
+                // parse; the poll timer is a belt-and-braces fallback that
+                // also drives the last read once the transfer ends.
+                FileView {
+                  id: dlLog
+                  path: ""
+                  watchChanges: true
+                  onFileChanged: dlLog.reload()
+                  onLoaded: drow.parseLog()
+                  onLoadFailed: function() {
+                    if (!drow.finished) dlPollTimer.start()
+                  }
+                }
+
+                Timer {
+                  id: dlPollTimer
+                  interval: 1200
+                  running: false
+                  repeat: true
+                  onTriggered: {
+                    if (drow.finished) {
+                      dlPollTimer.stop()
+                      return
+                    }
+                    dlLog.reload()
+                  }
+                }
+
+                // Swing through the log: grab the latest aria2c summary line
+                // for live progress, and look for aria2c's final results table
+                // (written once the process exits) to settle done/failed.
+                function parseLog() {
+                  var txt = dlLog.text() || ""
+                  if (!txt) return
+                  var lines = txt.split("\n")
+                  var p = null
+                  for (var i = lines.length - 1; i >= 0 && !p; i--)
+                    p = Model.parseAriaProgress(lines[i])
+                  if (p) {
+                    var total = Model.parseSize(p.total)
+                    if (p.percent >= 0) {
+                      drow.progress = p.percent
+                    } else if (total > 0) {
+                      drow.progress = Math.max(0, Math.min(100,
+                        Math.round(Model.parseSize(p.downloaded) / total * 100)))
+                    }
+                    drow.dlBytes = p.downloaded
+                    drow.dlTotal = p.total
+                    drow.dlSpeed = p.dl
+                    drow.dlEta = p.eta
+                    drow.dlState = "downloading"
+                  }
+                  if (txt.indexOf("Download Results:") >= 0) {
+                    var ok = false
+                    var fail = false
+                    for (var r = 0; r < lines.length; r++) {
+                      var m = lines[r].match(/^\s*\S+\|([A-Z]+)\|/)
+                      if (!m) continue
+                      if (m[1] === "OK") ok = true
+                      else if (m[1] === "ERR") fail = true
+                    }
+                    if (ok) {
+                      drow.dlState = "done"
+                      drow.progress = 100
+                      drow.finished = true
+                    } else if (fail) {
+                      drow.dlState = "failed"
+                      drow.finished = true
+                    }
+                    if (drow.finished) {
+                      dlPollTimer.stop()
+                      Quickshell.execDetached(["rm", "-f", drow.logPath])
+                    }
+                  }
+                }
+
+                Column {
+                  id: dlCol
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.leftMargin: Style.space(8)
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(4)
+
+                  Row {
+                    width: parent.width
+                    spacing: Style.space(6)
+
+                    Text {
+                      id: dEpLabel
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: "EP " + String(ep || "?")
+                      color: Color.accent
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+
+                    Text {
+                      width: parent.width - dEpLabel.implicitWidth - stateText.implicitWidth - Style.space(12)
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: title || show || ""
+                      elide: Text.ElideRight
+                      color: root.barForeground
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.body
+                    }
+
+                    Text {
+                      id: stateText
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: drow.dlState === "done"
+                        ? "Done"
+                        : (drow.dlState === "failed"
+                          ? "Failed"
+                          : (drow.progress >= 0
+                            ? drow.progress + "%"
+                            : "Connecting…"))
+                      color: drow.dlState === "done"
+                        ? Color.accent
+                        : (drow.dlState === "failed"
+                          ? Qt.rgba(root.barForeground.r, root.barForeground.g, root.barForeground.b, 1)
+                          : Color.accent)
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                    }
+                  }
+
+                  // Progress bar.
+                  Rectangle {
+                    id: dlBar
+                    width: parent.width
+                    height: Style.space(4)
+                    radius: height / 2
+                    color: Qt.rgba(root.barForeground.r, root.barForeground.g, root.barForeground.b, 0.15)
+
+                    Rectangle {
+                      width: Math.max(0, Math.min(1, drow.progress / 100)) * parent.width
+                      height: parent.height
+                      radius: parent.radius
+                      color: drow.dlState === "failed"
+                        ? Qt.rgba(1, 0.35, 0.35, 0.85)
+                        : Color.accent
+                    }
+                  }
+
+                  // Meta line: bytes / speed / ETA, or the final result.
+                  Text {
+                    width: parent.width
+                    text: {
+                      if (drow.dlState === "done")
+                        return "Saved to " + (drow.adoptDir || root.downloadDir)
+                      if (drow.dlState === "failed")
+                        return "Download failed"
+                      var bits = []
+                      if (drow.dlBytes && drow.dlTotal)
+                        bits.push(Model.formatSize(drow.dlBytes) + " / " + Model.formatSize(drow.dlTotal))
+                      if (drow.dlSpeed)
+                        bits.push(Model.formatSize(drow.dlSpeed) + "/s")
+                      if (drow.dlEta)
+                        bits.push("ETA " + drow.dlEta)
+                      return bits.length ? bits.join(" · ") : "Waiting for peers…"
+                    }
+                    elide: Text.ElideRight
+                    color: Qt.darker(root.barForeground, 1.4)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                MouseArea {
+                  id: drowMouse
+                  property bool hovered: false
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  onEntered: hovered = true
+                  onExited: hovered = false
+                  onClicked: {
+                    if (drow.dlState === "done")
+                      Quickshell.execDetached(["xdg-open", drow.adoptDir || root.downloadDir])
+                  }
+                }
+              }
+            }
           }
         }
       }

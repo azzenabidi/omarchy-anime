@@ -10,7 +10,14 @@ Usage:
         Print available episodes as JSON on stdout.
 
     anime-fetch download "<magnet>" "<show title>" "<episode>" [<dir>]
-        Launch a detached aria2c download for one episode.
+        Launch a detached aria2c download for one episode and print
+        {ok, pid, dir, log} (the log file carries live progress).
+
+    anime-fetch adopt
+        Reprint current live downloads as JSON [{pid, magnet, show, ep,
+        title, dir, log}], pruning entries whose aria2c has exited and
+        removing their temp logs. Used by the shell to re-adopt in-flight
+        transfers after a restart.
 
     anime-fetch --check
         Print "ok" and exit 0 if aria2c is available.
@@ -29,6 +36,7 @@ Print one JSON object on stdout (json.dumps, ensure_ascii=False):
 Exit status 0 on success (even when episodes == []), non-zero on a hard error.
 """
 
+import fcntl
 import html
 import json
 import os
@@ -36,11 +44,17 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 
 USER_AGENT = "Mozilla/5.0 (anime-plugin)"
 TIMEOUT = 15
+
+# Download registry used to re-adopt detached transfers after a shell restart.
+# Keyed by the aria2c pid; pruned when the process exits. Lives in the temp
+# dir so both the helper and the shell (same user) can reach it.
+MANIFEST = os.path.join(tempfile.gettempdir(), "anime-dl-manifest.json")
 
 
 def fetch(url):
@@ -366,6 +380,63 @@ def nyaa_models(term, *titles):
 
 
 # ---------------------------------------------------------------------------
+def _aria2c_alive(pid):
+    """True while the given pid is a running aria2c process."""
+    if not pid:
+        return False
+    try:
+        with open("/proc/%s/comm" % int(pid)) as f:
+            return f.read().strip() == "aria2c"
+    except (OSError, ValueError):
+        return False
+
+
+def _prune(entries):
+    """Drop dead entries (their temp logs are removed) and cap the list."""
+    alive = []
+    for e in entries:
+        if _aria2c_alive(e.get("pid")):
+            alive.append(e)
+            continue
+        log = e.get("log")
+        if log:
+            try:
+                if os.path.exists(log):
+                    os.remove(log)
+            except OSError:
+                pass
+    return alive[-64:]
+
+
+def _manifest_update(fn):
+    """Run fn(entries) under an exclusive lock; fn returns the new list."""
+    fd = os.open(MANIFEST, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        raw = os.read(fd, 1 << 20).decode("utf-8", "replace")
+        entries = []
+        if raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    entries = parsed
+            except ValueError:
+                entries = []
+        entries = fn(entries)
+        if entries is None:
+            entries = []
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, json.dumps(entries, indent=1).encode("utf-8"))
+        return entries
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(fd)
+
+
 def command_exists(name):
     try:
         r = subprocess.run(["sh", "-c", "command -v " + shlex.quote(name)],
@@ -378,7 +449,13 @@ def command_exists(name):
 def cmd_download(args):
     """anime-fetch download <magnet> <show title> <episode> [<dir>]
 
-    Launch a detached aria2c torrent download. Returns exit 0 once started.
+    Launch a detached aria2c torrent download and return exit 0 once started.
+    Detaching means the transfer survives the Quickshell shell (panel closes,
+    plugin reloads, restarts).
+
+    aria2c runs with --summary-interval=1 and writes its console output to a
+    per-download log file in the temp dir; the caller polls that file for live
+    progress. Prints JSON {ok, pid, dir, log} on stdout.
     """
     if len(args) >= 1:
         magnet = args[0]
@@ -408,27 +485,53 @@ def cmd_download(args):
         "aria2c",
         "--dir", dl_dir,
         "--seed-time=0",
-        "--summary-interval=0",
-        "--console-log-level=warn",
+        "--summary-interval=1",
+        "--console-log-level=error",
         "--bt-enable-lpd=true",
         magnet,
     ]
     try:
-        # Fully detach: new session, stdout/stderr to a log file. The QML
-        # layer reports "started" immediately; progress is visible in aria2's
-        # log files and the download directory.
-        import tempfile
-        log = os.path.join(tempfile.gettempdir(), "anime-aria2.log")
-        with open(log, "ab") as lf:
+        # Fully detach: new session, stdout/stderr to that download's own log
+        # file. mkstemp creates it immediately so a poller can attach before
+        # aria2c writes anything. The console summaries streamed every second
+        # double as the progress feed for the UI.
+        fd, log = tempfile.mkstemp(prefix="anime-dl-", suffix=".log",
+                                   dir=tempfile.gettempdir())
+        with os.fdopen(fd, "ab") as lf:
             proc = subprocess.Popen(argv, start_new_session=True,
                                     stdout=lf, stderr=lf,
                                     stdin=subprocess.DEVNULL)
+        # Register in the adopt manifest (pruning anything already dead).
+        def _record(entries):
+            return (_prune(entries) + [{
+                "pid": proc.pid, "magnet": magnet, "show": show, "ep": ep,
+                "title": "", "dir": dl_dir, "log": log}])[-64:]
+        _manifest_update(_record)
         sys.stdout.write(json.dumps({
             "ok": True, "pid": proc.pid, "dir": dl_dir, "log": log}))
         return 0
     except Exception as e:
         sys.stdout.write(json.dumps({"ok": False, "error": str(e)}))
         return 1
+
+
+def cmd_adopt(args):
+    """anime-fetch adopt
+
+    Return live downloads as JSON [{pid, magnet, show, ep, title, dir, log}].
+    Dead entries are pruned from the manifest and their temp logs removed, so
+    repeated calls (e.g. after restarts) never resurrect stale transfers.
+    """
+    live = []
+
+    def _keep(entries):
+        kept = _prune(entries)
+        live.extend(kept)
+        return kept
+
+    _manifest_update(_keep)
+    sys.stdout.write(json.dumps(live, ensure_ascii=False))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +543,9 @@ def main():
         else:
             sys.stdout.write("missing")
         return 0 if command_exists("aria2c") else 1
+
+    if titles and titles[0] == "adopt":
+        return cmd_adopt(titles[1:])
 
     if titles and titles[0] == "download":
         return cmd_download(titles[1:])

@@ -28,6 +28,14 @@ to Nyaa (English-subbed 720p), and hands the chosen magnet to a headless
     has nothing, filtering out batches/specials/movies
   - pick the exact episode, and a headless `aria2c --seed-time=0` grabs the
     magnet into your configured download folder
+  - **Live download progress**: each started download shows a progress bar in
+    the episode picker (percent, downloaded/total, transfer speed and ETA),
+    updated by polling aria2c's per-download log file until it finishes;
+    completed rows show the save folder and open it on click
+  - **Survives restarts**: downloads run detached from the shell, so closing
+    the panel, reloading the plugin, or restarting Quickshell won't kill an
+    in-progress transfer — the episode picker re-adopts still-running
+    downloads (progress, save folder) from their registry on the next load
 - **Stale-friendly refresh**: the list is kept across failed refreshes so the
   popup never flashes empty, with automatic retries
 - Finished/upcoming entries are tagged with their status (e.g. "Finished
@@ -72,7 +80,8 @@ Settings live in `~/.config/omarchy/shell.json` under the widget config for
 2. Find a show and click its download button (**download icon**, right side of
    the row).
 3. The panel switches to an episode picker — click any episode to start the
-   download. A status line confirms the download target.
+   download. A live progress bar (percent, speed, ETA) tracks each download
+   under the episode list until it completes.
 4. `Esc` or the back button returns to the season list.
 
 ## Helper script
@@ -87,7 +96,8 @@ directly:
 # Look up a show's released episodes (SubsPlease, then Nyaa)
 ~/.config/omarchy/plugins/azzen.anime/anime-fetch "<romaji>" "<english>" "<japanese>"
 
-# Download an episode via headless aria2c
+# Download an episode via a detached aria2c (prints {ok, pid, dir, log};
+# live progress is in the log file)
 ~/.config/omarchy/plugins/azzen.anime/anime-fetch download "<magnet>" "<show>" "<ep>" "~/Downloads"
 ```
 
