@@ -4,20 +4,57 @@
 // serves structured MyAnimeList data in the Jikan v4 schema. We hit
 // /v1/seasons/now, which mirrors https://myanimelist.net/anime/season, and
 // list every entry of the current season (currently airing, finished while
-// this season ran, or still upcoming), sorted by broadcast day/time (JST).
+// this season ran, or still upcoming), sorted by broadcast day/time (local).
 
-// URL for the current season from MyAnimeList via Tenrai. No API key needed.
-// `sfw=true` drops 18+ entries (behind the MAL safe-for-work filter).
-function seasonUrl() {
-  return "https://api.tenrai.org/v1/seasons/now?sfw=true"
-}
+// Season data comes from `anime-fetch season`, which merges every page of the
+// Jikan-style API into one response; see the python helper for the endpoint.
 
-// Ordered list of broadcast weekdays (JST). Used to sort the list by "next"
+// Ordered list of broadcast weekdays (local). Used to sort the list by "next"
 // airing day and to group rows under a day heading.
 var DAYS = [
   "Mondays", "Tuesdays", "Wednesdays", "Thursdays",
   "Fridays", "Saturdays", "Sundays"
 ]
+
+// JST is UTC+9 with no daylight saving. Broadcast times come back from the
+// API as JST wall clocks; this converts them to the shell's local calendar.
+var JST_OFFSET = 9 * 3600 * 1000
+
+// Convert a (JST weekday, JST "HH:MM") broadcast slot into the equivalent
+// local time, anchored to the JST week containing today so daylight-saving
+// offsets resolve through the Date object. Returns { day, time } with the
+// local weekday and zero-padded "HH:MM", or null when the time is unknown.
+function localBroadcast(jstDay, jstTime) {
+  var tm = /^(\d{1,2}):(\d{2})$/.exec(String(jstTime || "").trim())
+  if (!tm) return null
+  var hour = parseInt(tm[1], 10)
+  var minute = parseInt(tm[2], 10)
+  if (hour > 23 || minute > 59) return null
+
+  var st = canonicalDay(jstDay)
+  var targetIndex = st ? DAYS.indexOf(st) : -1
+
+  // JST wall-clock fields of "now".
+  var now = new Date()
+  var jst = new Date(now.getTime() + JST_OFFSET)
+  var y = jst.getUTCFullYear()
+  var mo = jst.getUTCMonth()
+  var d = jst.getUTCDate()
+
+  // Days until the next matching JST weekday (0 when it falls today).
+  // DAYS is Monday-first while Date#getUTCDay is Sunday-first; realign.
+  var targetGetDay = targetIndex >= 0 ? (targetIndex + 1) % 7 : -1
+  var ahead = targetGetDay >= 0 ? (targetGetDay - jst.getUTCDay() + 7) % 7 : 0
+
+  // The exact instant this episode airs — JST wall time minus its offset.
+  var local = new Date(Date.UTC(y, mo, d + ahead, hour, minute) - JST_OFFSET)
+
+  var weekdays = ["Sundays", "Mondays", "Tuesdays", "Wednesdays",
+                  "Thursdays", "Fridays", "Saturdays"]
+  var hh = ("0" + local.getHours()).slice(-2)
+  var mm = ("0" + local.getMinutes()).slice(-2)
+  return { day: weekdays[local.getDay()], time: hh + ":" + mm }
+}
 
 // Normalize a Jikan broadcast.day string ("Mondays", "Monday", etc.) to our
 // canonical "Mondays" form, or "" when unknown.
@@ -44,7 +81,7 @@ function titleOf(item) {
 // ("Currently Airing", "Finished Airing", "Not yet aired"); the per-item
 // `status` is kept so the UI can tag non-airing entries. Returns
 // { items: [...], season: <label or "">, total: <count of season entries> }.
-function parseSeason(raw, maxItems) {
+function parseSeason(raw) {
   var out = { items: [], season: "", total: 0 }
   var data
   try {
@@ -77,6 +114,37 @@ function parseSeason(raw, maxItems) {
     var day = canonicalDay(broadcast.day)
     var dayIndex = DAYS.indexOf(day)
     var time = String(broadcast.time || "")
+
+    // Advertised slot is a JST wall clock; present it in the local timezone.
+    var conv = day ? localBroadcast(day, time) : null
+    if (conv) {
+      day = conv.day
+      time = conv.time
+      dayIndex = DAYS.indexOf(day)
+    }
+
+    // Filterable tag set: MAL splits these across genre/themes/demographics/
+    // explicit lists, but users filter on any of them ("Harem" is a theme).
+    // Keep the canonical `genres` (display) separate from `allGenres` (filter).
+    var tagNames = []
+    function mergeTags(arr) {
+      for (var t = 0; t < (arr || []).length; t++) {
+        var n = (arr[t] || {}).name
+        if (n && tagNames.indexOf(n) < 0) tagNames.push(n)
+      }
+    }
+    mergeTags(it.genres)
+    mergeTags(it.themes)
+    mergeTags(it.demographics)
+    mergeTags(it.explicit_genres)
+    // MAL's Ecchi tag is really a nudity rating (R+, "Mild Nudity"); the feed
+    // omits it, so derive it from the rating string.
+    var rating = String(it.rating || "")
+    if (rating.indexOf("R+") >= 0 || rating.indexOf("Rx") >= 0 ||
+        rating.toLowerCase().indexOf("nudity") >= 0) {
+      if (tagNames.indexOf("Ecchi") < 0) tagNames.push("Ecchi")
+    }
+
     airing.push({
       malId: it.mal_id,
       url: it.url || "",
@@ -94,7 +162,8 @@ function parseSeason(raw, maxItems) {
       time: time,
       broadcastString: formatBroadcast(day, time),
       studios: (it.studios || []).map(function(s) { return s.name }).join(", "),
-      genres: (it.genres || []).map(function(g) { return g.name }).join(", ")
+      genres: (it.genres || []).map(function(g) { return g.name }).join(", "),
+      allGenres: tagNames.join(", ")
     })
   }
 
@@ -106,8 +175,6 @@ function parseSeason(raw, maxItems) {
   })
 
   out.total = airing.length
-  var limit = Math.max(1, parseInt(String(maxItems), 10) || 30)
-  if (airing.length > limit) airing = airing.slice(0, limit)
   out.items = airing
   out.display = buildDisplay(airing)
   return out
@@ -131,12 +198,80 @@ function buildDisplay(items) {
   return out
 }
 
+// Genre tags across the whole season, sorted by frequency (ties: name).
+// Every row contributes its combined `allGenres` (genres + themes + ...).
+// "Ecchi" is kept even when nothing matches right now (the feed rarely tags
+// it), so the filter chip always remains available.
+function genreList(parsed) {
+  var counts = {}
+  var items = (parsed && parsed.items) || []
+  for (var i = 0; i < items.length; i++) {
+    var parts = String(items[i].allGenres || items[i].genres || "").split(", ")
+    for (var p = 0; p < parts.length; p++) {
+      var g = parts[p]
+      if (g) counts[g] = (counts[g] || 0) + 1
+    }
+  }
+  var list = []
+  for (var name in counts) {
+    if (Object.prototype.hasOwnProperty.call(counts, name)) list.push({ name: name, count: counts[name] })
+  }
+  if (!counts["Ecchi"]) list.push({ name: "Ecchi", count: 0 })
+  list.sort(function(a, b) {
+    if (a.count !== b.count) return b.count - a.count
+    return a.name < b.name ? -1 : 1
+  })
+  return list
+}
+
+// Live keyword + genre filter over the season. `keyword` matches the romaji
+// or English title (case-insensitive substring); `genres` is an array of
+// genre names — a show passes if it carries any of the selected ones.
+// Returns the same interleaved day-header display shape as buildDisplay().
+function filterDisplay(parsed, keyword, genres) {
+  var items = (parsed && parsed.items) || []
+  var kw = String(keyword || "").trim().toLowerCase()
+  var gs = (genres || []).map(function(g) { return String(g).toLowerCase() })
+
+  var keep = []
+  for (var i = 0; i < items.length; i++) {
+    var it = items[i]
+    if (kw) {
+      var t = String(it.title || "").toLowerCase()
+      var te = String(it.titleEnglish || "").toLowerCase()
+      if (t.indexOf(kw) < 0 && te.indexOf(kw) < 0) continue
+    }
+    if (gs.length) {
+      var itemGenres = String(it.allGenres || it.genres || "").toLowerCase().split(", ")
+      var hit = false
+      for (var g = 0; g < gs.length && !hit; g++) {
+        if (itemGenres.indexOf(gs[g]) !== -1) hit = true
+      }
+      if (!hit) continue
+    }
+    keep.push(it)
+  }
+
+  var out = []
+  var group = ""
+  for (var k = 0; k < keep.length; k++) {
+    var it = keep[k]
+    var heading = (it.dayIndex === 99) ? "TBA" : it.day.replace(/s$/, "s")
+    if (heading !== group) {
+      group = heading
+      out.push({ header: true, label: heading })
+    }
+    out.push(it)
+  }
+  return out
+}
+
 // "Mondays · 22:00" from a canonical day + time, or "TBA".
 function formatBroadcast(day, time) {
   if (!day && !time) return "TBA"
   var parts = []
   if (day) parts.push(day)
-  if (time) parts.push(time + " JST")
+  if (time) parts.push(time)
   return parts.join(" · ")
 }
 
@@ -172,7 +307,7 @@ function pageSlice(display, page, pageSize) {
 // Up to 4 genre names for a row meta line ("Adventure · Drama · Fantasy").
 function genreLine(item) {
   if (!item) return ""
-  var out = String(item.genres || "").split(", ").filter(function (g) { return g !== "" })
+  var out = String(item.allGenres || item.genres || "").split(", ").filter(function (g) { return g !== "" })
   return out.slice(0, 4).join(" · ")
 }
 

@@ -83,7 +83,7 @@ BarWidget {
 
   Process {
     id: countProc
-    command: ["curl", "-fsS", "--max-time", "10", Model.seasonUrl()]
+    command: [root.scriptPath, "season"]
     stdout: StdioCollector {
       id: countOut
       waitForEnd: true
@@ -97,7 +97,7 @@ BarWidget {
         root.loading = false
         root.failed = false
         root.fetchedOnce = true
-        var p = Model.parseSeason(raw, 0)
+        var p = Model.parseSeason(raw)
         root.airingCount = p.total
         // Share the fetch with the panel so it doesn't re-download on open.
         if (panelLoader.item && !panelLoader.item.failed && panelLoader.item.parsed && panelLoader.item.parsed.display.length === 0) {

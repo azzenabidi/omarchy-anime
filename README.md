@@ -1,111 +1,73 @@
 # Omarchy Anime
 
-An Omarchy shell plugin that keeps track of the current anime season on your
-status bar and lets you download episodes straight from the popup.
-
-It pulls the current season's shows from MyAnimeList (via the MAL-based
-Jikan API), lists **every** entry of the season — currently airing, finished
-while the season ran, and still upcoming — with each show's airing day/time
-in a panel, and — with a click on a show's download button — looks up
-released episodes on SubsPlease (720p `[SubsPlease]` releases), falling back
-to Nyaa (English-subbed 720p), and hands the chosen magnet to a headless
-`aria2c` download.
+Track the current anime season right from your status bar. A badge shows how
+many shows are listed this season; click it to browse the full season, filter
+it down, and start downloads of individual episodes without leaving the shell.
 
 ## Features
 
-- **Status bar badge** with the number of anime in the current season
-- **Season panel**: cover art, title, airing day/time (JST), type, airing
-  status, score and genres for every show listed on MAL for the season
-- **New / sequel badges** (S1 drops the badge, later parts are tagged, e.g.
-  "S4")
-- **Pagination** for large seasons
-- **Episode downloader**:
-  - per-show download button opens an episode picker
-  - looks up released episodes on **SubsPlease** first (`[SubsPlease]` 720p)
-    with a smart title matcher (STOP-word filtering, season-aware grouping —
-    correctly matching e.g. "Ascendance of a Bookworm S4" over the original)
-  - falls back to **Nyaa** for English-subbed 720p releases when SubsPlease
-    has nothing, filtering out batches/specials/movies
-  - pick the exact episode, and a headless `aria2c --seed-time=0` grabs the
-    magnet into your configured download folder
-  - **Live download progress**: each started download shows a progress bar in
-    the episode picker (percent, downloaded/total, transfer speed and ETA),
-    updated by polling aria2c's per-download log file until it finishes;
-    completed rows show the save folder and open it on click
-  - **Survives restarts**: downloads run detached from the shell, so closing
-    the panel, reloading the plugin, or restarting Quickshell won't kill an
-    in-progress transfer — the episode picker re-adopts still-running
-    downloads (progress, save folder) from their registry on the next load
-- **Stale-friendly refresh**: the list is kept across failed refreshes so the
-  popup never flashes empty, with automatic retries
-- Finished/upcoming entries are tagged with their status (e.g. "Finished
-  Airing") instead of being hidden
-
-## Dependencies
-
-- `aria2c` (for downloads) — `omarchy pkg add aria2`
-- `jq`, `node` (only if you run the helper scripts by hand; the plugin itself
-  uses the bundled stdlib-only `anime-fetch` helper)
+- **Status bar badge** — a live count of the season's shows
+- **Full season browser** — every show MAL lists this season (airing,
+  finished, or still upcoming), with cover art, score, type, status and
+  genres, grouped by airing day
+- **Your local timezone** — broadcast slots are converted from JST to your
+  system's time, so shows land under the weekday and time you actually see
+- **New / sequel badges** — first seasons vs. continuations (e.g. "S4")
+- **Instant filters** — type to search titles, or tap a genre chip (all MAL
+  genres, incl. Harem/Ecchi); the list narrows as you go
+- **Pagination** — comfortable browsing through large seasons
+- **One-click downloads** — pick a show, pick the episode: released episodes
+  are found automatically (SubsPlease first, then Nyaa) and fetched by a
+  lightweight `aria2c`
+- **Live progress** — the picker shows a progress bar, percent, speed and ETA
+  per download, and finished episodes open their save folder on click
+- **Downloads survive restarts** — in-flight transfers keep running even if
+  the shell reloads or restarts, and reappear in the picker with their
+  progress intact
+- **Stale-friendly** — the list never flashes empty on a failed refresh; it
+  keeps the last good data and retries
 
 ## Installation
 
 ```bash
-# 1. Add the plugin from git and enable it
 omarchy plugin add https://github.com/azzenabidi/omarchy-anime.git --enable
+```
 
-# 2. Install aria2 if you want downloads
+Install `aria2` if you want downloads:
+
+```bash
 omarchy pkg add aria2
+```
 
-# 3. The bar widget should now appear; find it in the layout with:
+The shell hot-reloads the widget on save. Find the new widget in your bar
+layout with:
+
+```bash
 omarchy bar list
 ```
 
-The shell hot-reloads the widget on save — no restart needed.
-
 ## Settings
 
-Settings live in `~/.config/omarchy/shell.json` under the widget config for
-`azzen.anime`.
+Configure the widget under `azzen.anime` in `~/.config/omarchy/shell.json`:
 
 | Setting | Default | Description |
 |---|---|---|
-| `refreshMinutes` | `60` | How often to refresh the season list (min 5) |
-| `refreshMinutes` | `60` | How often to refresh the season list (min 5) |
-| `maxItems` | `30` | Max anime shown in the popup |
-| `downloadDir` | `~/Downloads` | Folder `aria2c` saves downloads into |
+| `refreshMinutes` | `60` | How often to refresh the season list |
+| `downloadDir` | `~/Downloads` | Where episodes are saved |
 
 ## Usage
 
-1. Click the badge (shows the airing count) to open the panel.
-2. Find a show and click its download button (**download icon**, right side of
-   the row).
-3. The panel switches to an episode picker — click any episode to start the
-   download. A live progress bar (percent, speed, ETA) tracks each download
-   under the episode list until it completes.
-4. `Esc` or the back button returns to the season list.
-
-## Helper script
-
-`anime-fetch` is a self-contained Python 3 (stdlib only) script, also usable
-directly:
-
-```bash
-# Check for aria2c
-~/.config/omarchy/plugins/azzen.anime/anime-fetch --check
-
-# Look up a show's released episodes (SubsPlease, then Nyaa)
-~/.config/omarchy/plugins/azzen.anime/anime-fetch "<romaji>" "<english>" "<japanese>"
-
-# Download an episode via a detached aria2c (prints {ok, pid, dir, log};
-# live progress is in the log file)
-~/.config/omarchy/plugins/azzen.anime/anime-fetch download "<magnet>" "<show>" "<ep>" "~/Downloads"
-```
+1. Click the badge to open the season list.
+2. Use the search box or genre chips to narrow it down.
+3. Click a show's download button to open its episode picker.
+4. Click an episode to start downloading — follow the live progress bar.
+5. `Esc` or the back arrow returns to the season list.
 
 ## Credits
 
-- Season data: [MyAnimeList](https://myanimelist.net) via the Jikan API
-- Releases: [SubsPlease](https://subsplease.org) and [Nyaa](https://nyaa.si)
-- Icon: FontAwesome (used via the bundled Ui toolkit)
+- Season data: [MyAnimeList](https://myanimelist.net)
+- Episode releases: [SubsPlease](https://subsplease.org) and [Nyaa](https://nyaa.si)
+- Downloads: [aria2](https://aria2.github.io)
 
 ## License
 

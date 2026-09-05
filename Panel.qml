@@ -144,8 +144,33 @@ Panel {
   // prev/next controls drawn under the list.
   property int pageSize: 8
   property int page: 0
-  // Derived slice of `parsed.display` for the current page + page metadata.
-  property var paged: Model.pageSlice(root.parsed.display, root.page, root.pageSize)
+
+  // --- Live filters (keyword + genre) applied over the season ---
+  property string filterKeyword: ""
+  property var filterGenres: []
+  readonly property bool filterActive: root.filterKeyword !== "" || root.filterGenres.length > 0
+  readonly property var seasonGenres: Model.genreList(root.parsed)
+  readonly property var filtered: Model.filterDisplay(root.parsed, root.filterKeyword, root.filterGenres)
+  readonly property int filteredCount: root.filtered.reduce(function(n, x) {
+    return x.header === true ? n : n + 1
+  }, 0)
+
+  function toggleGenre(name) {
+    var set = root.filterGenres.slice()
+    var idx = set.indexOf(name)
+    if (idx >= 0) set.splice(idx, 1)
+    else set.push(name)
+    root.filterGenres = set
+    root.page = 0
+  }
+  function clearFilters() {
+    root.filterKeyword = ""
+    root.filterGenres = []
+    root.page = 0
+  }
+
+  // Derived slice of `filtered` for the current page + page metadata.
+  property var paged: Model.pageSlice(root.filtered, root.page, root.pageSize)
   readonly property int pageIndex: root.paged.page
   readonly property int totalPages: root.paged.totalPages
 
@@ -185,7 +210,7 @@ Panel {
 
   Process {
     id: fetchProc
-    command: ["curl", "-fsS", "--max-time", "10", Model.seasonUrl()]
+    command: [root.scriptPath, "season"]
     stdout: StdioCollector {
       id: fetchOut
       waitForEnd: true
@@ -197,7 +222,7 @@ Panel {
           root.scheduleRetry()
           return
         }
-        root.parsed = Model.parseSeason(raw, root.setting("maxItems", 30))
+        root.parsed = Model.parseSeason(raw)
         root.page = 0
         root.failed = false
         root.loading = false
@@ -272,10 +297,80 @@ Panel {
           }
           title: "This Season"
           meta: Model.seasonLabel(root.parsed)
-          detail: root.loading ? "Loading…" : String(root.parsed.total)
+          detail: root.loading
+            ? "Loading…"
+            : (root.filterActive
+              ? String(root.filteredCount) + " / " + String(root.parsed.total)
+              : String(root.parsed.total))
         }
 
         PanelSeparator { foreground: root.barForeground }
+
+        // ---- Live filters: keyword field + genre chip bar ----
+        Column {
+          id: filterRoot
+          visible: !root.inPicker && root.parsed.items.length > 0 && root.pickerState === "hidden"
+          width: parent.width
+          spacing: Style.space(4)
+
+          Row {
+            width: parent.width
+            spacing: Style.space(6)
+
+            TextField {
+              id: kwField
+              width: parent.width - (clearBtn.visible ? clearBtn.implicitWidth + Style.space(6) : 0)
+              placeholderText: "Filter by title…"
+              foreground: root.barForeground
+              verticalPadding: Style.space(3)
+              onTextEdited: {
+                root.filterKeyword = text
+                root.page = 0
+              }
+            }
+
+            Button {
+              id: clearBtn
+              iconText: "\uF05E"
+              iconSize: Style.font.caption
+              foreground: root.barForeground
+              tooltipText: "Clear filters"
+              visible: root.filterActive
+              onClicked: {
+                kwField.text = ""
+                root.clearFilters()
+              }
+            }
+          }
+
+          Flickable {
+            id: genreBar
+            width: parent.width
+            height: genreRow.implicitHeight
+            contentWidth: genreRow.implicitWidth
+            boundsBehavior: Flickable.StopAtBounds
+            clip: true
+            interactive: genreRow.implicitWidth > width
+
+            Row {
+              id: genreRow
+              spacing: Style.space(4)
+
+              Repeater {
+                model: root.seasonGenres
+                Button {
+                  text: modelData.name
+                  fontSize: Style.font.caption
+                  foreground: root.barForeground
+                  selected: root.filterGenres.indexOf(modelData.name) >= 0
+                  horizontalPadding: Style.space(5)
+                  verticalPadding: Style.space(2)
+                  onClicked: root.toggleGenre(modelData.name)
+                }
+              }
+            }
+          }
+        }
 
         Flickable {
           id: listScroll
@@ -301,6 +396,18 @@ Panel {
               text: root.failed
                 ? "Couldn't reach MyAnimeList"
                 : (root.loading ? "Loading…" : "Nothing airing this season")
+              color: root.barForeground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.body
+              topPadding: Style.space(16)
+              bottomPadding: Style.space(16)
+            }
+
+            Text {
+              width: parent.width
+              visible: root.parsed.display.length > 0 && root.filterActive && root.filtered.length === 0
+              horizontalAlignment: Text.AlignHCenter
+              text: "No shows match these filters"
               color: root.barForeground
               font.family: Style.font.family
               font.pixelSize: Style.font.body
@@ -392,7 +499,7 @@ Panel {
 
                       Text {
                         id: timeText
-                        text: (row.itemData.time || "") !== "" ? row.itemData.time + " JST" : "TBA"
+                        text: (row.itemData.time || "") !== "" ? row.itemData.time : "TBA"
                         color: root.barForeground
                         font.family: Style.font.family
                         font.pixelSize: Style.font.caption
@@ -474,6 +581,7 @@ Panel {
                 // clicks separate from the row's "open MAL page" action.
                 Button {
                   id: dlButton
+                  visible: !row.isHeader
                   anchors.right: parent.right
                   anchors.rightMargin: Style.space(2)
                   anchors.verticalCenter: parent.verticalCenter

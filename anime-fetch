@@ -19,6 +19,10 @@ Usage:
         removing their temp logs. Used by the shell to re-adopt in-flight
         transfers after a restart.
 
+    anime-fetch season
+        Fetch every page of the current MAL season and print the merged
+        response {data: [...]} on stdout (Jikan paginates 25 per page).
+
     anime-fetch --check
         Print "ok" and exit 0 if aria2c is available.
 
@@ -50,6 +54,11 @@ import urllib.request
 
 USER_AGENT = "Mozilla/5.0 (anime-plugin)"
 TIMEOUT = 15
+
+# Current season from MyAnimeList via Tenrai (Jikan v4 schema). `sfw=true`
+# drops 18+ entries (behind the MAL safe-for-work filter). Jikan paginates at
+# 25 per page, so the whole season needs every page fetched and merged.
+SEASON_URL = "https://api.tenrai.org/v1/seasons/now?sfw=true"
 
 # Download registry used to re-adopt detached transfers after a shell restart.
 # Keyed by the aria2c pid; pruned when the process exits. Lives in the temp
@@ -380,6 +389,60 @@ def nyaa_models(term, *titles):
 
 
 # ---------------------------------------------------------------------------
+def cmd_season(args):
+    """anime-fetch season
+
+    Print the whole current season as one merged Jikan response
+    {data: [...], pagination: {items: {total: n}}} on stdout. The API pages
+    at 25 entries, so every page is fetched (concurrently) and de-duplicated
+    by mal_id — callers see the season without a size cap.
+    """
+    import concurrent.futures
+
+    try:
+        first = json.loads(fetch(SEASON_URL))
+    except Exception as e:
+        sys.stdout.write(json.dumps({"data": [], "error": str(e)}))
+        return 1
+
+    data = list(first.get("data") or [])
+    last = (first.get("pagination") or {}).get("last_visible_page", 1) or 1
+
+    if last > 1:
+        def grab(page):
+            try:
+                return json.loads(fetch(SEASON_URL + "&page=" + str(page)))
+            except Exception:
+                return {"data": []}
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+                for r in ex.map(grab, range(2, last + 1)):
+                    data.extend(r.get("data") or [])
+        except Exception as e:
+            sys.stdout.write(json.dumps({"data": [], "error": str(e)}))
+            return 1
+
+    seen = set()
+    merged = []
+    for it in data:
+        if not isinstance(it, dict):
+            continue
+        mid = it.get("mal_id")
+        if mid is not None and mid in seen:
+            continue
+        if mid is not None:
+            seen.add(mid)
+        merged.append(it)
+
+    sys.stdout.write(json.dumps({
+        "data": merged,
+        "pagination": {"items": {"total": len(merged)}}},
+        ensure_ascii=False))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 def _aria2c_alive(pid):
     """True while the given pid is a running aria2c process."""
     if not pid:
@@ -543,6 +606,9 @@ def main():
         else:
             sys.stdout.write("missing")
         return 0 if command_exists("aria2c") else 1
+
+    if titles and titles[0] == "season":
+        return cmd_season(titles[1:])
 
     if titles and titles[0] == "adopt":
         return cmd_adopt(titles[1:])

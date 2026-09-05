@@ -20,12 +20,10 @@
     "defaultSection": "right",
     "defaults": {
       "refreshMinutes": 60,
-      "maxItems": 30,
       "downloadDir": "~/Downloads"
     },
     "schema": [
       { "key": "refreshMinutes", "type": "number", "label": "Refresh interval (minutes)" },
-      { "key": "maxItems", "type": "number", "label": "Max anime in popup" },
       { "key": "downloadDir", "type": "string", "label": "aria2c download folder" }
     ]
   }
