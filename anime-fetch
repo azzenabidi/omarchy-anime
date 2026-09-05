@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+"""anime-fetch — locate and download episodes for a currently-airing anime.
+
+Primary source: SubsPlease (https://subsplease.org) via its JSON API.
+Fallback source: Nyaa (https://nyaa.si) Anime - English-translated (1_2),
+preferring 720p releases.
+
+Usage:
+    anime-fetch "<romaji title>" "<english title>" "<japanese title>"
+        Print available episodes as JSON on stdout.
+
+    anime-fetch download "<magnet>" "<show title>" "<episode>" [<dir>]
+        Launch a detached aria2c download for one episode.
+
+    anime-fetch --check
+        Print "ok" and exit 0 if aria2c is available.
+
+Print one JSON object on stdout (json.dumps, ensure_ascii=False):
+
+    {
+      "query": "<search term used>",
+      "source": "subsplease" | "nyaa" | "none",
+      "note": "...",                    // human summary shown in the UI
+      "episodes": [
+         { "n": "28", "title": "...", "magnet": "magnet:?...", "size": "..." }
+      ]
+    }
+
+Exit status 0 on success (even when episodes == []), non-zero on a hard error.
+"""
+
+import html
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+
+USER_AGENT = "Mozilla/5.0 (anime-plugin)"
+TIMEOUT = 15
+
+
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def norm(s):
+    """Lowercase, collapse whitespace, strip common accent/subtitle marks."""
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(r"[!?.,:;~`\-'\"()\[\]{}]", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def tokens(s):
+    return [t for t in norm(s).split(" ") if t]
+
+
+def jaccard(a, b):
+    if not a or not b:
+        return 0.0
+    sa, sb = set(a), set(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def best_match(query, candidates, threshold=0.5):
+    """Return candidate with highest token overlap vs query, or None."""
+    qtok = tokens(query)
+    best, bestscore = None, 0.0
+    for c in candidates:
+        score = jaccard(qtok, tokens(c))
+        if score > bestscore:
+            best, bestscore = c, score
+    if best is None or bestscore < threshold:
+        return None
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Search keyword derivation
+# ---------------------------------------------------------------------------
+STOP = {"the", "of", "to", "in", "and", "no", "wa", "nanimo", "hen", "tame",
+        "ni", "shisho", "show", "that", "does", "not", "this", "is", "a", "an",
+        "be", "minase", "imasu", "masu", "at"}
+
+
+def derive_keyword(*titles):
+    """Best guess at a SubsPlease-friendly show slug from MAL title fields.
+
+    Prefers the romaji / romanised title; grabs the longest leading run of
+    significant words (up to 4) after dropping filler/grammar words so the
+    search query stays distinctive but tolerant of extra subtitle text.
+    """
+    ranked = []  # (length, phrase)
+    for t in titles:
+        toks = tokens(t)
+        if not toks:
+            continue
+        while toks and toks[0] in STOP:
+            toks.pop(0)
+        if not toks:
+            continue
+        for length in (4, 3, 2):
+            ranked.append((length, " ".join(toks[:length])))
+    if not ranked:
+        return ""
+    ranked.sort(key=lambda x: -x[0])
+    return ranked[0][1]
+
+
+# ---------------------------------------------------------------------------
+# SubsPlease
+# ---------------------------------------------------------------------------
+ROMAN = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7,
+         "viii": 8, "ix": 9, "x": 10}
+JAP_DIGIT = {"第4期": 4, "第四期": 4, "第五部": 5, "第四部": 4, "第一部": 1,
+             "第二部": 2, "第三部": 3}
+
+
+def parsed_season(*titles):
+    """Detect a season/part number from MAL title fields. 0 if none found."""
+    n = 0
+
+    def bump(v):
+        nonlocal n
+        if v and v > n:
+            n = v
+
+    for t in titles:
+        if not t:
+            continue
+        s = norm(t)
+        for m in re.finditer(r"\b(?:season|s(?:eason)?)\s*#?\s*(?:(\d+)|([a-z]+))", s):
+            bump(int(m.group(1)) if m.group(1) else ROMAN.get(m.group(2), 0))
+        for m in re.finditer(r"\b(\d+)\s*(?:st|nd|rd|th)?\s*season\b", s):
+            bump(int(m.group(1)))
+        for m in re.finditer(r"\bpart\s*#?\s*(\d+)\b", s):
+            bump(int(m.group(1)))
+        for m in re.finditer(r"\s([ivx]+)\s*$", s):
+            bump(ROMAN.get(m.group(1), 0))
+        for jp, v in JAP_DIGIT.items():
+            if jp in t:
+                bump(v)
+    return n
+
+
+def group_season_score(base):
+    """Return (season, has_marker): season number found in a SubsPlease
+    group name, plus whether the group explicitly names a season."""
+    s = norm(base)
+    season, has = 0, False
+    for m in re.finditer(r"(?:\bseason\s*|\bs\s*|\bs)(\d{1,2})\b", s):
+        v = int(m.group(1))
+        if v > season:
+            season, has = v, True
+    # Trailing roman/arabic part marker ("... II", "... Part 2").
+    m = re.search(r"\b(?:part)?\s*([ivx]+)\s*$", s)
+    if m:
+        v = ROMAN.get(m.group(1), 0)
+        if v > season:
+            season, has = v, True
+    m = re.search(r"\bpart\s*(\d{1,2})\b", s)
+    if m:
+        v = int(m.group(1))
+        if v > season:
+            season, has = v, True
+    return season, has
+
+
+def subsplease_search(term):
+    url = "https://subsplease.org/api/?f=search&tz=JST&s=" + urllib.parse.quote(term)
+    data = json.loads(fetch(url))
+    # data: { "<Show> - <Ep>": {show, episode, downloads:[{res,magnet,...}]} }
+    return data
+
+
+def is_batch_key(key, ep):
+    """A release key is a batch if its episode label is a range or empty."""
+    return bool(re.search(r"\d+\s*[-–]\s*\d+", ep)) or not ep
+
+
+def subsplease_models(term, *titles):
+    """Return (query, episodes, note)."""
+    if not term:
+        return term, [], "No search term"
+    # SubsPlease's search matches a substring, so a trailing subtitle word
+    # (e.g. "Shisho") can zero out results. Retry dropping trailing words.
+    qwords = term.split(" ")
+    data = None
+    last_len = 0
+    for cut in range(len(qwords), 0, -1):
+        q = " ".join(qwords[:cut])
+        try:
+            data = subsplease_search(q)
+            last_len = cut
+            if isinstance(data, dict) and data:
+                term = q
+                break
+        except Exception as e:
+            return q, [], "SubsPlease unreachable: %s" % e
+    if not isinstance(data, dict) or not data:
+        return term, [], "No SubsPlease results for '%s'" % term
+
+    # Group result keys by their show base ("<Show> - <Ep>" -> "<Show>").
+    groups = {}
+    for key, val in data.items():
+        show, _, ep = key.rpartition(" - ")
+        base = show or key
+        groups.setdefault(base, []).append((key, val, ep))
+
+    want_season = parsed_season(*titles)
+
+    # Pick the group whose name best overlaps the provided titles. Groups that
+    # explicitly carry the MAL season marker win ties (e.g. "Honzuki ... S4"
+    # over the plain 3rd-season group while S4 airs).
+    qtoks = tokens(term)
+    best_group = None
+    best_score = 0.0
+    best_sw = False
+    for base in groups:
+        score = jaccard(qtoks, tokens(base))
+        s_season, s_has = group_season_score(base)
+        sw = s_has and (want_season == 0 or s_season == want_season)
+        # Group explicitly carrying the exact MAL season marker beats all
+        # overlapping non-season-named groups (e.g. "... S4" vs "...")
+        # while that season airs.
+        if want_season > 0 and sw and s_season == want_season:
+            eff = 10.0 + score
+        else:
+            eff = score + (0.15 if sw else 0.0)
+        if eff > best_score or (eff == best_score and sw and not best_sw):
+            best_group, best_score, best_sw = base, eff, sw
+
+    if best_group is None:
+        return term, [], "No SubsPlease match for '%s'" % term
+
+    eps = groups[best_group]
+    episodes = []
+    for key, val, ep in eps:
+        if not val or not isinstance(val, dict):
+            continue
+        if is_batch_key(key, ep):
+            continue
+        downloads = val.get("downloads") or []
+        res_map = {}
+        for d in downloads:
+            if not isinstance(d, dict):
+                continue
+            res = str(d.get("res", ""))
+            if d.get("magnet") and res not in res_map:
+                res_map[res] = d["magnet"]
+        magnet = res_map.get("720") or res_map.get("480") or list(res_map.values())[0]
+        if not magnet:
+            continue
+        episodes.append({
+            "n": str(ep),
+            "title": key,
+            "magnet": magnet,
+            "size": "",
+        })
+
+    if not episodes:
+        return term, [], "Found SubsPlease show but no usable magnet"
+
+    # Sort numerically-aware ("2" before "10").
+    episodes.sort(key=lambda e: (len(e["n"]), e["n"]))
+    return term, episodes, "SubsPlease · %s" % best_group
+
+
+# ---------------------------------------------------------------------------
+# Nyaa
+# ---------------------------------------------------------------------------
+def nyaa_models(term, *titles):
+    q = " ".join(tokens(term)) + " 720p"
+    url = "https://nyaa.si/?f=0&c=1_2&q=" + urllib.parse.quote(q)
+    try:
+        body = fetch(url)
+    except Exception as e:
+        return q, [], "Nyaa unreachable: %s" % e
+
+    # Pull torrent rows out of the results table.
+    rows = []
+    for m in re.finditer(
+        r'<tr[^>]*class="(?:[^"]*\b(default|success)\b[^"]*)"[^>]*>(.*?)</tr>',
+        body, re.S):
+        rows.append(m.group(2))
+    if not rows:
+        return q, [], "No Nyaa results for '%s'" % q
+
+    qtoks = set(tokens(term))
+    episodes = []
+    for r in rows:
+        am = re.search(r'href="(magnet:[^"]+)"', r)
+        if not am:
+            continue
+        # Only the torrent-name cell links to /view/<id> (no fragment) and
+        # carries a title; comment-count links are /view/<id>#comments with
+        # class="comments" and must not be treated as a release name.
+        title_a = re.search(r'<a href="/view/\d+"\s+title="([^"]+)"[^>]*>', r)
+        if not title_a:
+            continue
+        name = html.unescape(title_a.group(1))
+        size_m = re.search(r'<td class="text-center">([^<]+)</td>', r)
+        size = html.unescape(size_m.group(1)).strip() if size_m else ""
+
+        # Prefer eng-subbed, 720p, SubsPlease-tag, non-batch, single episode.
+        name_l = name.lower()
+        if "batch" in name_l or "specials" in name_l or "movie" in name_l:
+            continue
+
+        # Episode number: drop [bracketed] junk (hashes/res thumbs), the
+        # container extension, then look for S04E19 / E20 / " - 20 (720p)" /
+        # a standalone trailing episode number.
+        clean = re.sub(r"\[[^\]]*\]", " ", name)
+        clean = re.sub(r"\.(mkv|mp4|avi|mov|webm|mkv)$", " ", clean, flags=re.I)
+        n = None
+        m = re.search(r"\bS?\d{1,3}\s*E\s*(\d{1,3})\b", clean, re.I)
+        if not m:
+            m = re.search(r"\b(?:ep|episode)\s*\.?\s*(\d{1,3})\b", clean, re.I)
+        if not m:
+            m = re.search(r"[-–]\s*(\d{1,3})\s*(?:$|\()", clean)
+        if not m:
+            m = re.search(r"(?:^|\W)(\d{1,3})(?:\W|$)", clean)
+        if m:
+            n = m.group(1)
+        if n is None:
+            continue
+
+        episodes.append({
+            "n": n,
+            "title": name,
+            "magnet": html.unescape(am.group(1)),
+            "size": size,
+            "preferred": ("[subsplease]" in name_l) or ("subsplease" in name_l),
+        })
+
+    if not episodes:
+        return q, [], "No single-episode Nyaa releases for '%s'" % q
+
+    # Sort by resolution quality then seeders.
+    def res_rank(e):
+        t = e["title"].lower()
+        for i, key in enumerate(("1080", "720", "480")):
+            if key in t:
+                return i
+        return 3
+    episodes.sort(key=lambda e: (res_rank(e), 0 if e["preferred"] else 1, e["n"]))
+    # Keep the best-scoring distinct episode number (dedupe by n, pick first).
+    unique = {}
+    for e in episodes:
+        if e["n"] not in unique:
+            unique[e["n"]] = e
+    episodes = [unique[k] for k in sorted(unique, key=lambda k: (len(k), k))]
+
+    note = "Nyaa · eng 720p"
+    return q, episodes, note
+
+
+# ---------------------------------------------------------------------------
+def command_exists(name):
+    try:
+        r = subprocess.run(["sh", "-c", "command -v " + shlex.quote(name)],
+                           capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def cmd_download(args):
+    """anime-fetch download <magnet> <show title> <episode> [<dir>]
+
+    Launch a detached aria2c torrent download. Returns exit 0 once started.
+    """
+    if len(args) >= 1:
+        magnet = args[0]
+    else:
+        magnet = ""
+    show = args[1] if len(args) > 1 else "anime"
+    ep = args[2] if len(args) > 2 else ""
+    dl_dir = args[3] if len(args) > 3 else os.path.expanduser("~/Downloads")
+
+    if not magnet.startswith("magnet:?"):
+        sys.stdout.write(json.dumps({"ok": False, "error": "Not a magnet link"}))
+        return 1
+    if not command_exists("aria2c"):
+        sys.stdout.write(json.dumps({"ok": False,
+                                     "error": "aria2c not installed"}))
+        return 1
+
+    # One safe download filename: "<Show> - <ep>.mkv". aria2c chooses the real
+    # name from the torrent metadata anyway (this is just the spotter label).
+    base = re.sub(r"[^\w .+\-()]", "_", show).strip()
+    if ep:
+        base = "%s - %s" % (base, ep)
+
+    os.makedirs(dl_dir, exist_ok=True)
+
+    argv = [
+        "aria2c",
+        "--dir", dl_dir,
+        "--seed-time=0",
+        "--summary-interval=0",
+        "--console-log-level=warn",
+        "--bt-enable-lpd=true",
+        magnet,
+    ]
+    try:
+        # Fully detach: new session, stdout/stderr to a log file. The QML
+        # layer reports "started" immediately; progress is visible in aria2's
+        # log files and the download directory.
+        import tempfile
+        log = os.path.join(tempfile.gettempdir(), "anime-aria2.log")
+        with open(log, "ab") as lf:
+            proc = subprocess.Popen(argv, start_new_session=True,
+                                    stdout=lf, stderr=lf,
+                                    stdin=subprocess.DEVNULL)
+        sys.stdout.write(json.dumps({
+            "ok": True, "pid": proc.pid, "dir": dl_dir, "log": log}))
+        return 0
+    except Exception as e:
+        sys.stdout.write(json.dumps({"ok": False, "error": str(e)}))
+        return 1
+
+
+# ---------------------------------------------------------------------------
+def main():
+    titles = sys.argv[1:] if len(sys.argv) > 1 else [""]
+    if titles and titles[0] == "--check":
+        if command_exists("aria2c"):
+            sys.stdout.write("ok")
+        else:
+            sys.stdout.write("missing")
+        return 0 if command_exists("aria2c") else 1
+
+    if titles and titles[0] == "download":
+        return cmd_download(titles[1:])
+
+    romaji, english, japanese = (titles + ["", "", ""])[:3]
+
+    # Drop redundant fields (english == romaji or a strict substring) so a
+    # cracked search term isn't padded with duplicate words ("kami kami").
+    def distinct(a, b):
+        na, nb = norm(a), norm(b)
+        return nb and na != nb and not na.endswith(" " + nb) and not nb.endswith(" " + na)
+    for fld in (english, japanese):
+        if not fld:
+            continue
+        if not distinct(romaji, fld):
+            if fld == english:
+                english = ""
+            if fld == japanese:
+                japanese = ""
+
+    keyword = derive_keyword(romaji, english, japanese)
+    if not keyword or len(tokens(keyword)) < 2:
+        sys.stdout.write(json.dumps({
+            "query": "", "source": "none", "note": "Could not derive a search term",
+            "episodes": []}, ensure_ascii=False))
+        return 0
+
+    # Prefer SubsPlease; fall back to Nyaa only when it yields nothing.
+    query, episodes, note = subsplease_models(keyword, romaji, english, japanese)
+    source = "subsplease"
+    if not episodes:
+        query2, episodes2, note2 = nyaa_models(keyword, romaji, english, japanese)
+        if episodes2:
+            query, episodes, note, source = query2, episodes2, note2, "nyaa"
+        elif note2 and note.startswith("No SubsPlease"):
+            note = note2
+
+    out = {
+        "query": query,
+        "source": source,
+        "note": note,
+        "episodes": episodes,
+    }
+    sys.stdout.write(json.dumps(out, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
