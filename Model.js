@@ -3,8 +3,8 @@
 // Data source: Tenrai (https://tenrai.org) — a free, authless API that
 // serves structured MyAnimeList data in the Jikan v4 schema. We hit
 // /v1/seasons/now, which mirrors https://myanimelist.net/anime/season, and
-// keep only the entries that are "Currently Airing", sorted by broadcast
-// day/time (JST).
+// list every entry of the current season (currently airing, finished while
+// this season ran, or still upcoming), sorted by broadcast day/time (JST).
 
 // URL for the current season from MyAnimeList via Tenrai. No API key needed.
 // `sfw=true` drops 18+ entries (behind the MAL safe-for-work filter).
@@ -39,11 +39,13 @@ function titleOf(item) {
   return "Unknown"
 }
 
-// Parse the /seasons/now JSON body into a flat, sorted array of airing items.
-// Only season entries whose status is "Currently Airing" are included. Returns
-// { items: [...], season: <label or "">, total the current season has> }.
+// Parse the /seasons/now JSON body into a flat, sorted array of season items.
+// Every entry of the current season is included regardless of airing status
+// ("Currently Airing", "Finished Airing", "Not yet aired"); the per-item
+// `status` is kept so the UI can tag non-airing entries. Returns
+// { items: [...], season: <label or "">, total: <count of season entries> }.
 function parseSeason(raw, maxItems) {
-  var out = { items: [], season: "", totalAiring: 0 }
+  var out = { items: [], season: "", total: 0 }
   var data
   try {
     data = JSON.parse(String(raw || ""))
@@ -67,7 +69,7 @@ function parseSeason(raw, maxItems) {
   var seen = {}
   for (var i = 0; i < list.length; i++) {
     var it = list[i]
-    if (!it || it.status !== "Currently Airing") continue
+    if (!it) continue
     // Jikan returns a title once per category it scrapes; keep the first.
     if (it.mal_id !== undefined && seen[it.mal_id]) continue
     if (it.mal_id !== undefined) seen[it.mal_id] = true
@@ -86,6 +88,7 @@ function parseSeason(raw, maxItems) {
       episodes: it.episodes,
       score: it.score,
       synopsis: it.synopsis || "",
+      status: it.status || "",
       day: day || "TBA",
       dayIndex: dayIndex === -1 ? 99 : dayIndex,
       time: time,
@@ -102,7 +105,7 @@ function parseSeason(raw, maxItems) {
     return a.title < b.title ? -1 : 1
   })
 
-  out.totalAiring = airing.length
+  out.total = airing.length
   var limit = Math.max(1, parseInt(String(maxItems), 10) || 30)
   if (airing.length > limit) airing = airing.slice(0, limit)
   out.items = airing
@@ -110,7 +113,7 @@ function parseSeason(raw, maxItems) {
   return out
 }
 
-// Flatten the airing items into a rendering list that interleaves day-group
+// Flatten the season items into a rendering list that interleaves day-group
 // headers ("{day}s") with the rows under them. Unknown days collect under one
 // "TBA" group at the end.
 function buildDisplay(items) {
@@ -139,14 +142,16 @@ function formatBroadcast(day, time) {
 
 // Tool name for the popup's hero detail.
 function seasonLabel(parsed) {
-  return parsed && parsed.season ? parsed.season : "Currently Airing"
+  return parsed && parsed.season ? parsed.season : "This Season"
 }
 
-// Small description line for a row: TYPE · SCORE.
+// Small description line for a row: TYPE · STATUS · SCORE · EPS. The airing
+// status is only shown when it's not "Currently Airing" (that's the default).
 function typeScoreLine(item) {
   if (!item) return ""
   var parts = []
   if (item.type) parts.push(item.type)
+  if (item.status && item.status !== "Currently Airing") parts.push(item.status)
   if (typeof item.score === "number") parts.push("Score " + item.score.toFixed(2))
   if (item.episodes) parts.push(item.episodes + " eps")
   return parts.join("  ·  ")

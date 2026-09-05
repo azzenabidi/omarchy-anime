@@ -1,19 +1,21 @@
 # Omarchy Anime
 
-An Omarchy shell plugin that keeps track of currently airing anime on your
+An Omarchy shell plugin that keeps track of the current anime season on your
 status bar and lets you download episodes straight from the popup.
 
 It pulls the current season's shows from MyAnimeList (via the MAL-based
-Jikan API), shows each show's airing day/time in a panel, and — with a click
-on a show's download button — looks up released episodes on SubsPlease
-(720p `[SubsPlease]` releases), falling back to Nyaa (English-subbed 720p),
-and hands the chosen magnet to a headless `aria2c` download.
+Jikan API), lists **every** entry of the season — currently airing, finished
+while the season ran, and still upcoming — with each show's airing day/time
+in a panel, and — with a click on a show's download button — looks up
+released episodes on SubsPlease (720p `[SubsPlease]` releases), falling back
+to Nyaa (English-subbed 720p), and hands the chosen magnet to a headless
+`aria2c` download.
 
 ## Features
 
-- **Status bar badge** with the count of currently airing anime
-- **Season panel**: cover art, title, airing day/time (JST), type, score and
-  genres for every show currently airing on MAL
+- **Status bar badge** with the number of anime in the current season
+- **Season panel**: cover art, title, airing day/time (JST), type, airing
+  status, score and genres for every show listed on MAL for the season
 - **New / sequel badges** (S1 drops the badge, later parts are tagged, e.g.
   "S4")
 - **Pagination** for large seasons
@@ -28,6 +30,8 @@ and hands the chosen magnet to a headless `aria2c` download.
     magnet into your configured download folder
 - **Stale-friendly refresh**: the list is kept across failed refreshes so the
   popup never flashes empty, with automatic retries
+- Finished/upcoming entries are tagged with their status (e.g. "Finished
+  Airing") instead of being hidden
 
 ## Dependencies
 
@@ -57,6 +61,7 @@ Settings live in `~/.config/omarchy/shell.json` under the widget config for
 
 | Setting | Default | Description |
 |---|---|---|
+| `refreshMinutes` | `60` | How often to refresh the season list (min 5) |
 | `refreshMinutes` | `60` | How often to refresh the season list (min 5) |
 | `maxItems` | `30` | Max anime shown in the popup |
 | `downloadDir` | `~/Downloads` | Folder `aria2c` saves downloads into |

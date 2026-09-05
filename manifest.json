@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "azzen.anime",
   "name": "Anime Airing",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "azzen",
   "license": "MIT",
-  "description": "Track currently airing anime from MyAnimeList (via the MAL-based Jikan API). Download episodes via SubsPlease (fallback Nyaa) with aria2c.",
+  "description": "Track the current anime season from MyAnimeList (via the MAL-based Jikan API). Download episodes via SubsPlease (fallback Nyaa) with aria2c.",
   "kinds": [
     "bar-widget"
   ],

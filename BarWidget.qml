@@ -10,8 +10,8 @@ BarWidget {
   id: root
   moduleName: "azzen.anime"
 
-  // Total count of currently airing anime, kept on the widget so the icon
-  // badge is available even while the panel is closed. -1 while unknown.
+  // Total count of anime in the current season, kept on the widget so the
+  // icon badge is available even while the panel is closed. -1 while unknown.
   property int airingCount: -1
   property bool loading: false
   property bool failed: false
@@ -73,8 +73,8 @@ BarWidget {
   property bool fetchedOnce: false
   function fetchOnce() {
     if (countProc.running) return
-    if (root.fetchedOnce && panelLoader.item && panelLoader.item.parsed && panelLoader.item.parsed.totalAiring) {
-      root.airingCount = panelLoader.item.parsed.totalAiring
+    if (root.fetchedOnce && panelLoader.item && panelLoader.item.parsed && panelLoader.item.parsed.total) {
+      root.airingCount = panelLoader.item.parsed.total
       return
     }
     loading = true
@@ -98,7 +98,7 @@ BarWidget {
         root.failed = false
         root.fetchedOnce = true
         var p = Model.parseSeason(raw, 0)
-        root.airingCount = p.totalAiring
+        root.airingCount = p.total
         // Share the fetch with the panel so it doesn't re-download on open.
         if (panelLoader.item && !panelLoader.item.failed && panelLoader.item.parsed && panelLoader.item.parsed.display.length === 0) {
           panelLoader.item.parsed = p
@@ -177,10 +177,10 @@ BarWidget {
   }
 
   readonly property string tooltip: {
-    if (root.loading) return "Currently airing anime — loading…"
-    if (root.failed) return "Currently airing anime — couldn't reach MyAnimeList"
+    if (root.loading) return "This season's anime — loading…"
+    if (root.failed) return "This season's anime — couldn't reach MyAnimeList"
     return root.airingCount >= 0
-      ? "Currently airing: " + root.airingCount + " anime (click for list)"
-      : "Currently airing anime (click for list)"
+      ? "This season: " + root.airingCount + " anime (click for list)"
+      : "This season's anime (click for list)"
   }
 }

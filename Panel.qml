@@ -242,9 +242,9 @@ Panel {
               font.pixelSize: Style.font.display
             }
           }
-          title: "Currently Airing"
+          title: "This Season"
           meta: Model.seasonLabel(root.parsed)
-          detail: root.loading ? "Loading…" : String(root.parsed.totalAiring)
+          detail: root.loading ? "Loading…" : String(root.parsed.total)
         }
 
         PanelSeparator { foreground: root.barForeground }
@@ -272,7 +272,7 @@ Panel {
               horizontalAlignment: Text.AlignHCenter
               text: root.failed
                 ? "Couldn't reach MyAnimeList"
-                : (root.loading ? "Loading…" : "Nothing airing right now")
+                : (root.loading ? "Loading…" : "Nothing airing this season")
               color: root.barForeground
               font.family: Style.font.family
               font.pixelSize: Style.font.body
